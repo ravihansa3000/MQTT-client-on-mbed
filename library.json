@@ -1,0 +1,28 @@
+{
+  "name": "MQTT-client-on-mbed",
+  "keywords": "mqtt, mbed",
+  "description": "MQTT client library for mbed platform",
+  "repository":
+  {
+    "type": "git",
+    "url": "https://github.com/kasperglobal/MQTT-client-on-mbed"
+  },
+  "authors":
+  [
+    {
+      "name": "Nick O'Leary"
+    },
+    {
+      "name": "Joerg Wende"
+    },
+    {
+      "name": "Akila Perera",
+      "email": "ravihansa3000@gmail.com",
+      "maintainer": true
+    }
+  ],
+  "version": "0.0.1",
+  "frameworks": "mbed",
+  "platforms": "*",
+  "include": "src"
+}
