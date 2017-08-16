@@ -1,11 +1,11 @@
 {
   "name": "MQTT-client-on-mbed",
-  "keywords": "mqtt, mbed",
+  "keywords": "mqtt",
   "description": "MQTT client library for mbed platform",
   "repository":
   {
     "type": "git",
-    "url": "https://github.com/kasperglobal/MQTT-client-on-mbed"
+    "url": "https://github.com/ravihansa3000/MQTT-client-on-mbed.git"
   },
   "authors":
   [
@@ -23,6 +23,5 @@
   ],
   "version": "0.0.1",
   "frameworks": "mbed",
-  "platforms": "*",
-  "include": "src"
+  "platforms": "*"
 }
