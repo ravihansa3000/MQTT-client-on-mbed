@@ -1,0 +1,24 @@
+{
+  "name": "MQTT-client-on-mbed",
+  "keywords": "mqtts",
+  "description": "Secure MQTT client using MBED TLS for SSL/TLS connection",
+  "repository":
+  {
+    "type": "git",
+    "url": "https://github.com/ravihansa3000/MQTT-client-on-mbed.git"
+  },
+  "authors":
+  [
+    {
+      "name": "Vergil Cola"
+    },
+    {
+      "name": "Akila Perera",
+      "email": "ravihansa3000@gmail.com",
+      "maintainer": true
+    }
+  ],
+  "version": "0.0.1",
+  "frameworks": "mbed",
+  "platforms": "*"
+}
