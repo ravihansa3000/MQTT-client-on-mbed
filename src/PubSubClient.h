@@ -1,22 +1,29 @@
 /*
 PubSubClient.h - A simple client for MQTT.
+
+Akila Ravihansa Perera
+
 Nicholas O'Leary
 http://knolleary.net
 */
 
+#ifndef PUBSUB_CLIENT_H
+#define PUBSUB_CLIENT_H
+
 #include "mbed.h"
-#include "TCPSocketConnection.h"
+#include "RtosLogger.h"
+#include "TCPSocket.h"
 
-#ifndef PubSubClient_h
-#define PubSubClient_h
+#define MQTT_VERSION_3_1      3
+#define MQTT_VERSION_3_1_1    4
 
-// MQTT_MAX_PACKET_SIZE : Maximum packet size
-#define MQTT_MAX_PACKET_SIZE 128
+#ifndef MQTT_VERSION
+#define MQTT_VERSION MQTT_VERSION_3_1_1
+#endif
 
-// MQTT_KEEPALIVE : keepAlive interval in Seconds
-#define MQTT_KEEPALIVE 15000
+#define MQTT_MAX_PACKET_SIZE 256 // Maximum packet size
+#define MQTT_KEEPALIVE 60 // Keep-alive interval in Seconds
 
-#define MQTTPROTOCOLVERSION 3
 #define MQTTCONNECT 1 << 4 // Client request to connect to Server
 #define MQTTCONNACK 2 << 4 // Connect Acknowledgment
 #define MQTTPUBLISH 3 << 4 // Publish message
@@ -37,41 +44,64 @@ http://knolleary.net
 #define MQTTQOS1 (1 << 1)
 #define MQTTQOS2 (2 << 1)
 
+#define MQTT_ERROR_NO_CONNECTION -1001
+#define MQTT_ERROR_PARAMETER -1002
+#define MQTT_MALFORMED_REMAINING_LENGTH -1003
+
+#if defined(MQTT_ENABLE_DEBUG_MODE)
+#define PUBSUB_DBG(x, ...) _logger->printf_time("[DEBUG][PUBSUB] " x "\r\n", ##__VA_ARGS__);
+#else
+#define PUBSUB_DBG(x, ...)
+#endif
+
+#define PUBSUB_INFO(x, ...) _logger->printf_time("[INFO][PUBSUB] " x "\r\n", ##__VA_ARGS__);
+#define PUBSUB_WARN(x, ...) _logger->printf_time("[WARN][PUBSUB] " x "\r\n", ##__VA_ARGS__);
+#define PUBSUB_ERR(x, ...) _logger->printf_time("[ERROR][PUBSUB] " x "\r\n", ##__VA_ARGS__);
+
 class PubSubClient {
+
 private:
-  Timer t;
-  TCPSocketConnection _client;
-  char buffer[MQTT_MAX_PACKET_SIZE];
-  int nextMsgId;
+
+  TCPSocket _socket;
+  Timer _timer;
+  const char* _ip;
+  int _port;
+  RtosLogger* _logger;
+  bool _is_connected;
+  NetworkInterface *_iface;
+  void (*_callback)(char*, uint8_t*, unsigned int);
+  uint8_t buffer[MQTT_MAX_PACKET_SIZE + 1];
+  uint16_t nextMsgId;
   unsigned long lastOutActivity;
   unsigned long lastInActivity;
   bool pingOutstanding;
+
   int millis();
-  void (*callback)(char*,char*,unsigned int);
-  int readPacket(int);
+  int readPacket(uint8_t*);
   char readByte();
-  bool write(short header, char* buf, int length);
-  int writeString(const char* string, char* buf, int pos);
-  const char* ip;
-  int port;
-  
+  bool write(short header, uint8_t* buf, int length);
+  int writeString(const char* string, uint8_t* buf, int pos);
+  int mqtt_event_handler();
+
 public:
-  PubSubClient();
-  PubSubClient(const char*, int, void(*)(char*,char*,unsigned int));
-  void setOptions(const char*, int, void(*)(char*,char*,unsigned int));
-  bool connect(const char *);
-  bool connect(const char *, const char *, const char *);
-  bool connect(const char *, const char *, short, short, const char *);
-  bool connect(const char *, const char *, const char *, const char *, short, short, const char*);
+
+  PubSubClient(RtosLogger *logger, NetworkInterface *iface, const char *ip, int port, void (*callback)(char*, uint8_t*, unsigned int));
+  ~PubSubClient();
+  void setOptions(const char*, int, void(*)(char*, uint8_t*, unsigned int));
+  int connect(const char *);
+  int connect(const char *, const char *, const char *);
+  int connect(const char *, const char *, short, short, const char *);
+  int connect(const char *, const char *, const char *, const char *, short, short, const char*);
   void disconnect();
   bool publish(const char *, const char *);
   bool publish(const char *, const char *, unsigned int);
   bool publish(const char *, const char *, unsigned int, bool);
-  //   bool publish_P(char *, short PROGMEM *, unsigned int, bool);
   bool subscribe(const char *);
+  bool subscribe(const char*, int);
   bool unsubscribe(const char *);
-  bool loop();
+  int loop();
   bool connected();
+  void dispatch_events();
 };
 
 #endif
