@@ -1,109 +1,97 @@
 #include "MQTTClient.h"
 
 namespace MQTT {
-void MQTTClient::start_listener() {
-  if (!_initialized) {
-    ERR("MQTT client has not been initialized, MQTT client listener will exit ... [FAIL]");
-    return;
-  }
-  if (_use_tls) {
-    init_tls();
-  }
-  INFO("MQTT client listener started ... [OK]");
-  while (_is_running) {  // connect loop
-    int rc = 0;
+
+int MQTTClient::cycle() {
+  int rc;
+
+  if (!_is_connected) {
+    if (_use_tls) {
+      init_tls();
+    }
+
     if ((rc = connect()) < 0) {
-      disconnect();
       if (rc == NSAPI_ERROR_PARAMETER || rc == NSAPI_ERROR_NO_SOCKET || rc == NSAPI_ERROR_NO_MEMORY ||
-          rc == NSAPI_ERROR_DEVICE_ERROR) {  // unrecoverable error
-        ERR("Unrecoverable network error detected (error code: %d), MQTT client listener will exit ... [FAIL]", rc);
-        return;
+          rc == NSAPI_ERROR_DHCP_FAILURE || rc == NSAPI_ERROR_DNS_FAILURE || rc == NSAPI_ERROR_DEVICE_ERROR) {
+        ERR("Network error occurred while connecting to MQTT broker (error code: %d) ... [FAIL]", rc);
+        return NETWORK_ERROR;
       } else {
-        ERR("Failed to establish MQTT connection (error code: %d), try again in %d seconds ... [FAIL]", rc,
-            (MQTT_RECONNECT_TIMEOUT / 1000));
-        Thread::wait(MQTT_RECONNECT_TIMEOUT);
-        continue;
+        ERR("Failed to establish MQTT connection (error code: %d) ... [FAIL]", rc);
+        return MQTT_ERROR;
       }
     }
 
-    if ((rc = process_subscriptions()) == SUCCESS) {
+    if ((rc = process_subscriptions()) == SUCCESS) {  // subscribe to MQTT topics in registered message handlers
       INFO("Successfully processed topic subscriptions ... [OK]");
     } else {
-      ERR("Failed to process topic subscriptions (error code: %d), try again in %d seconds ... [FAIL]", rc,
-          (MQTT_RECONNECT_TIMEOUT / 1000));
-      continue;
+      ERR("Failed to process topic subscriptions (error code: %d), MQTT client will disconnect ... [FAIL]", rc);
+      disconnect();
+      return MQTT_ERROR;
+    }
+  }
+
+  int type = read_packet();
+  switch (type) {
+    case TIMEOUT:  // No data available from the network
+      break;
+
+    case NSAPI_ERROR_PARAMETER:
+    case NSAPI_ERROR_NO_SOCKET:
+    case NSAPI_ERROR_NO_MEMORY:
+    case NSAPI_ERROR_DHCP_FAILURE:
+    case NSAPI_ERROR_DNS_FAILURE:
+    case NSAPI_ERROR_DEVICE_ERROR:
+    case NSAPI_ERROR_NO_CONNECTION: {
+      ERR("Network error detected (error code: %d), MQTT client will disconnect ... [FAIL]", type);
+      disconnect();
+      return NETWORK_ERROR;
     }
 
-    while (_is_running && _is_connected) {  // read loop
-      int type = read_packet();
-      switch (type) {
-        case TIMEOUT:  // No data available from the network
-          break;
+    case 0:  // MQTT broker has closed the connection
+    case FAILURE: {
+      ERR("Server error detected while reading packet (error code: %d), MQTT client will disconnect ... [FAIL]", type);
+      disconnect();
+      return MQTT_ERROR;
+    }
 
-        case NSAPI_ERROR_PARAMETER:
-        case NSAPI_ERROR_NO_SOCKET:
-        case NSAPI_ERROR_NO_MEMORY:
-        case NSAPI_ERROR_DEVICE_ERROR: {
-          ERR("Unrecoverable network error detected (error code: %d), MQTT client listener is exiting ... [FAIL]",
-              type);
-          return;
-        } break;
+    case BUFFER_OVERFLOW: {
+      ERR("Buffer overflow detected while reading packet, MQTT client will disconnect ... [FAIL]");
+      disconnect();
+      return BUFFER_OVERFLOW;
+    }
 
-        case 0:                          // server has closed the connection
-        case NSAPI_ERROR_NO_CONNECTION:  // connection has failed
-        case FAILURE: {
-          ERR("Error while reading packet (error code: %d), disconnecting ... [FAIL]", type);
-          disconnect();
-        } break;
+    case CONNACK:
+    case PUBACK:
+    case SUBACK:
+      break;
 
-        case BUFFER_OVERFLOW: {
-          ERR("Failure or buffer overflow detected, disconnecting ... [FAIL]");
-          disconnect();
-        } break;
-
-        case CONNACK:
-        case PUBACK:
-        case SUBACK:
-          break;
-
-        case PUBLISH: {  // received data from the MQTT server
-          if ((rc = handle_publish_message()) < 0) {
-            ERR("Error handling PUBLISH message received (error code: %d) ... [FAIL]", rc);
-          }
-        } break;
-
-        case PINGRESP: {
-          DBG("Got ping response...");
-          reset_connection_timer();
-        } break;
-
-        default: {
-          ERR("Unknown packet type from server. [type] %d", type);
-          if (type < 0) {  // unhandled network error
-            ERR("Unhandled network error, disconnecting ... [FAIL]");
-            disconnect();
-          }
-        }
+    case PUBLISH: {  // received data from the MQTT broker
+      if ((rc = handle_publish_message()) < 0) {
+        ERR("Error handling PUBLISH message received (error code: %d), MQTT client will disconnect ... [FAIL]", rc);
+        disconnect();
+        return MQTT_ERROR;
       }
+      break;
+    }
 
-      if (_is_connected && _is_running) {
-        if ((rc = has_connection_timed_out()) != 0) {  // check if its time to send a keepAlive packet
-          if (rc == -1 && _ping_request_sent == false) {
-            DBG("MQTT keep alive expired, sending ping request...");
-            _equeue.call(this, &MQTTClient::send_ping_request);
-          } else if (rc == -2) {
-            ERR("MQTT server is unresponsive, disconnecting ... [FAIL]");
-            disconnect();
-          }
-        }
+    case PINGRESP: {
+      DBG("Got ping response.");
+      reset_connection_timer();
+      break;
+    }
+
+    default: {
+      ERR("Unknown packet type from MQTT broker. [type] %d", type);
+      if (type < 0) {  // unhandled protocol error
+        ERR("Unhandled protocol error, MQTT client will disconnect ... [FAIL]");
+        disconnect();
+        return MQTT_ERROR;
       }
+    }
+  }
+  mqtt_health_check();
+  DBG("MQTT listener read packet end");
 
-    }  // end read loop
-  }    // end connect loop
+  return SUCCESS;
 }
-
-void MQTTClient::stop_listener() {
-  _is_running = false;
-  disconnect();
-}
-}
+}  // namespace MQTT

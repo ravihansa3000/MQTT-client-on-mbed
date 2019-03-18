@@ -2,12 +2,10 @@
 
 namespace MQTT {
 
-static void donothing(MessageData &md) {}
-
 /**
-* Read until a specified packet type is received, or untill the specified
-* timeout dropping packets along the way.
-**/
+ * Read until a specified packet type is received, or untill the specified
+ * timeout dropping packets along the way.
+ **/
 int MQTTClient::read_until(int packet_type, int timeout) {
   int type = FAILURE;
   Timer timer;
@@ -27,115 +25,53 @@ int MQTTClient::read_until(int packet_type, int timeout) {
   return type;
 }
 
-void MQTTClient::set_connection_parameters(const char *host, uint16_t port, MQTTPacket_connectData &options) {
-  _host = host;
-  _port = port;
-  _connect_options = options;
-}
-
-int MQTTClient::publish(const char *topic, const char *message, int qos) {
-  PubMessage pub_message;
-  pub_message.qos = (QoS)qos;
-  pub_message.id = (int)packetid.get_next();
-  strcpy(&pub_message.topic[0], topic);
-  strcpy(&pub_message.payload[0], message);
-  pub_message.payloadlen = strlen((const char *)&pub_message.payload[0]);
-
-  int id = _equeue.call(callback(this, &MQTTClient::send_publish), pub_message);
-  if (id == 0) {
-    ERR("Could not add to publish queue ... [FAIL]");
-    return FAILURE;
-  } else {
-    return SUCCESS;
-  }
-}
-
-int MQTTClient::send_publish(PubMessage &message) {
-  if (!_is_connected) {
-    ERR("Could not send queued publish message, not connected ... [FAIL]");
-    return FAILURE;
-  }
-  MQTTString mqtt_topic = MQTTString_initializer;
-  mqtt_topic.cstring = (char *)&message.topic[0];
-  _lock.lock();
-  int len = MQTTSerialize_publish(_sendbuf, MAX_MQTT_PACKET_SIZE, 0, message.qos, false, message.id, mqtt_topic,
-                                  (unsigned char *)&message.payload[0], (int)message.payloadlen);
-  if (len <= 0) {
-    ERR("Failed serializing publish message (error code: %d) ... [FAIL]", len);
-    _lock.unlock();
-    return FAILURE;
-  }
-  int rc = send_packet(len);
-  _lock.unlock();
-  if (rc == SUCCESS) {
-    // reset_connection_timer(); // reset timers if we have been able to send successfully
-    // TODO: troubleshoot mbedOS bug: send packet returns success although connection is broken
-    DBG("Successfully published message, [topic] %s, [payload] %s, [qos] %d", message.topic, message.payload,
-        message.qos);
-    Thread::wait(50);
-    return SUCCESS;
-  }
-  ERR("Failed to send queued publish message to server (error code: %d), disconnecting ... [FAIL]", rc);
-  disconnect();
-  return FAILURE;
-}
-
-void MQTTClient::add_topic_handler(const char *topic, Callback<void(MessageData &)> func) {
-  if (func) {
-    _topic_cb_map.insert(std::pair<std::string, Callback<void(MessageData &)>>(std::string(topic), func));
-  } else {
-    _topic_cb_map.insert(
-        std::pair<std::string, Callback<void(MessageData &)>>(std::string(topic), callback(donothing)));
-  }
-}
-
 int MQTTClient::process_subscriptions() {
   if (!_is_connected) {
     ERR("Session not connected ... [FAIL]");
-    return 0;
+    return FAILURE;
   }
 
   DBG("Processing subscribed topics...");
 
-  std::map<std::string, Callback<void(MessageData &)>>::iterator it;
-  for (it = _topic_cb_map.begin(); it != _topic_cb_map.end(); it++) {
+  for (int i = 0; i < MAX_MQTT_MESSAGE_HANDLERS; i++) {
+    if (_message_handlers[i].topic_filter == 0) {
+      continue;
+    }
     int len = 0;
     // TODO: We only subscribe to QoS = 0 for now
     QoS qos = QOS0;
-    MQTTString topic = {(char *)it->first.c_str(), {0, 0}};
+    MQTTString topic = {(char *)_message_handlers[i].topic_filter, {0, 0}};
     DBG("Subscribing to topic [%s]", topic.cstring);
-    _lock.lock();
-    len = MQTTSerialize_subscribe(_sendbuf, MAX_MQTT_PACKET_SIZE, 0, packetid.get_next(), 1, &topic, (int *)&qos);
+    len = MQTTSerialize_subscribe(_sendbuf, MAX_MQTT_PACKET_SIZE, 0, _packetid.get_next(), 1, &topic, (int *)&qos);
     if (len <= 0) {
       ERR("Error serializing subscribe packet (error code: %d) ... [FAIL]", len);
-      _lock.unlock();
       return FAILURE;
     }
     int rc = send_packet(len);
-    _lock.unlock();
     if (rc != SUCCESS) {
       ERR("Error sending subscribe packet. [topic] %s, [rc] %d ... [FAIL]", topic.cstring, rc);
       return rc;
     }
+    wait_ms(10);
 
     DBG("Waiting for subscription ack...");
     // Wait for SUBACK, dropping packets read along the way ...
-    if (read_until(SUBACK, COMMAND_TIMEOUT) == SUBACK) {  // wait for suback
+    if (read_until(SUBACK, MQTT_COMMAND_TIMEOUT) == SUBACK) {  // wait for suback
       int count = 0, grantedQoS = -1;
-      unsigned short mypacketid;
-      if (MQTTDeserialize_suback(&mypacketid, 1, &count, &grantedQoS, _readbuf, MAX_MQTT_PACKET_SIZE) == 1) {
+      unsigned short suback_packetid;
+      if (MQTTDeserialize_suback(&suback_packetid, 1, &count, &grantedQoS, _readbuf, MAX_MQTT_PACKET_SIZE) == 1) {
         rc = grantedQoS;  // 0, 1, 2 or 0x80
       }
       // For as long as we do not get 0x80 ..
       if (rc != 0x80) {
         reset_connection_timer();  // SUB and SUBACK sequence complete
-        INFO("Successfully subscribed to %s ... [OK]", it->first.c_str());
+        INFO("Successfully subscribed to %s ... [OK]", _message_handlers[i].topic_filter);
       } else {
-        ERR("Failed to subscribe to topic %s ... (not authorized?) ... [FAIL]", it->first.c_str());
+        ERR("Failed to subscribe to topic %s ... (not authorized?) ... [FAIL]", _message_handlers[i].topic_filter);
         return FAILURE;
       }
     } else {
-      ERR("Failed to subscribe to topic %s (ack not received) ... [FAIL]", it->first.c_str());
+      ERR("Failed to subscribe to topic %s (ack not received) ... [FAIL]", _message_handlers[i].topic_filter);
       return FAILURE;
     }
   }  // end for loop
@@ -143,8 +79,8 @@ int MQTTClient::process_subscriptions() {
   return SUCCESS;
 }
 
-bool MQTTClient::is_topic_matched(char *filter, MQTTString &mqtt_topic) {
-  char *curf = filter;
+bool MQTTClient::is_topic_matched(char *topic_filter, MQTTString &mqtt_topic) {
+  char *curf = topic_filter;
   char *curn = mqtt_topic.lenstring.data;
   char *curn_end = curn + mqtt_topic.lenstring.len;
 
@@ -165,35 +101,60 @@ bool MQTTClient::is_topic_matched(char *filter, MQTTString &mqtt_topic) {
 }
 
 int MQTTClient::handle_publish_message() {
+  int rc = FAILURE;
   MQTTString mqtt_topic = MQTTString_initializer;
-  Message msg;
   int intQoS;
+  void *payload_ptr;
+  MQTTMessage message;
   DBG("Deserializing publish message...");
-  if (MQTTDeserialize_publish((unsigned char *)&msg.dup, &intQoS, (unsigned char *)&msg.retained,
-                              (unsigned short *)&msg.id, &mqtt_topic, (unsigned char **)&msg.payload,
-                              (int *)&msg.payloadlen, _readbuf, MAX_MQTT_PACKET_SIZE) != 1) {
+  if (MQTTDeserialize_publish((unsigned char *)&message.dup, &intQoS, (unsigned char *)&message.retained,
+                              (unsigned short *)&message.id, &mqtt_topic, (unsigned char **)&payload_ptr,
+                              (int *)&message.payloadlen, _readbuf, MAX_MQTT_PACKET_SIZE) != 1) {
     ERR("Error deserializing published message ... [FAIL]");
     return -1;
   }
 
-  std::string topic;
+  message.qos = (QoS)intQoS;
   if (mqtt_topic.lenstring.len > 0) {
-    topic = std::string((const char *)mqtt_topic.lenstring.data, (size_t)mqtt_topic.lenstring.len);
+    if (mqtt_topic.lenstring.len > MAX_MQTT_TOPIC_SIZE) {
+      ERR("Error handling publish message, topic length exceeds max limit: [len] %d, [max] %d", mqtt_topic,
+          MAX_MQTT_TOPIC_SIZE);
+      return BUFFER_OVERFLOW;
+    }
+    snprintf(message.topic, mqtt_topic.lenstring.len + 1, "%s", mqtt_topic.lenstring.data);
   } else {
-    topic = (const char *)mqtt_topic.cstring;
-  }
-  DBG("Got message for topic [%s], QoS [%d]", topic.c_str(), intQoS);
-  msg.qos = (QoS)intQoS;
-  // Call the handlers for each topic
-  if (_topic_cb_map.find(topic) != _topic_cb_map.end()) {  // Call the callback function
-    DBG("Invoking function handler for topic...");
-    MessageData md(mqtt_topic, msg);
-    _topic_cb_map[topic].call(md);
-    return 1;
+    snprintf(message.topic, sizeof(message.topic), "%s", mqtt_topic.cstring);
   }
 
-  // TODO: depending on the QoS
-  // we send data to the server = PUBACK or PUBREC
+  if (message.payloadlen > MAX_MQTT_PAYLOAD_SIZE) {
+    ERR("Error handling publish message, payload length exceeds max limit: [len] %d, [max] %d", message.payloadlen,
+        MAX_MQTT_PAYLOAD_SIZE);
+    return BUFFER_OVERFLOW;
+  }
+  snprintf(message.payload, message.payloadlen + 1, "%s", (const char *)payload_ptr);
+  DBG("Handling MQTT PUB message: [topic] %s, [payload] %s, [payloadlen] %d, [QoS] %d", message.topic, message.payload,
+      message.payloadlen, message.qos);
+
+  if (intQoS != QOS0) {  // TODO: only QoS0 is supported for now
+    ERR("Error handling publish message, unsupported QoS: [topic] %s, [payload] %s, [QoS] %d", message.topic,
+        message.payload, message.qos);
+    return FAILURE;
+  }
+
+  // Call the handlers for each topic
+  for (int i = 0; i < MAX_MQTT_MESSAGE_HANDLERS; i++) {
+    if (_message_handlers[i].topic_filter != 0 &&
+        (MQTTPacket_equals(&mqtt_topic, (char *)_message_handlers[i].topic_filter) ||
+         is_topic_matched((char *)_message_handlers[i].topic_filter, mqtt_topic))) {
+      if (_message_handlers[i].topic_cb) {
+        DBG("Invoking function handler for topic...");
+        _message_handlers[i].topic_cb.call(message);
+        rc = SUCCESS;
+      }
+    }
+  }
+
+  // Depending on the QoS send data to the MQTT broker; PUBACK or PUBREC
   switch (intQoS) {
     case QOS0:  // send back nothing
       break;
@@ -210,25 +171,25 @@ int MQTTClient::handle_publish_message() {
       break;
   }
 
-  return 0;
+  return rc;
 }
 
 void MQTTClient::reset_connection_timer() {
   if (_keepalive_interval > 0) {
-    _com_timer.reset();
-    _com_timer.start();
+    _timer.reset();
+    _timer.start();
     _ping_request_sent = false;
   }
 }
 
 int MQTTClient::has_connection_timed_out() {
-  if (_keepalive_interval > 0) {  // check connection timer
-    if ((unsigned int)_com_timer.read_ms() > (2 * _keepalive_interval)) {
-      return -2;
-    } else if ((unsigned int)_com_timer.read_ms() > _keepalive_interval) {
-      return -1;
+  if (_keepalive_interval > 0) {  // check connection timer only if keep alive is set
+    if ((unsigned int)_timer.read_ms() > (2 * _keepalive_interval)) {
+      return -2;  // PING response not received during grace period, MQTT broker unresponsive
+    } else if ((unsigned int)_timer.read_ms() > _keepalive_interval) {
+      return -1;  // keep alive expired, time to send a PING request
     } else {
-      return 0;
+      return 0;  // keep alive has not expired
     }
   }
   return 0;
@@ -242,32 +203,106 @@ void MQTTClient::send_ping_request() {
   _lock.lock();
   int len = MQTTSerialize_pingreq(_sendbuf, MAX_MQTT_PACKET_SIZE);
   if (len <= 0) {
-    ERR("Failed serializing ping request message (error code: %d) ... [FAIL]", len);
     _lock.unlock();
+    ERR("Failed serializing ping request message (error code: %d) ... [FAIL]", len);
     return;
   }
   int rc = send_packet(len);
   _lock.unlock();
-  if (rc == SUCCESS) {  // send the ping packet
-    // reset_connection_timer(); // reset timers if we have been able to send successfully
+
+  if (rc == SUCCESS) {
+    // reset_connection_timer();  // reset timers if we have been able to send successfully
     // TODO: troubleshoot mbedOS bug: send packet returns success although connection is broken
     _ping_request_sent = true;
-    DBG("Ping request sent successfully ... [OK]");
+    DBG("MQTT client ping request sent successfully ... [OK]");
   } else {
+    ERR("Failed to send MQTT client ping request (error code: %d). MQTT client will disconnect ... [FAIL]", rc);
     disconnect();
-    ERR("Error sending ping request (error code: %d) ... [FAIL]", rc);
   }
 }
 
-RtosLogger *MQTTClient::logger() { return _logger; }
+void MQTTClient::clear_send_buffer() {
+  _lock.lock();
+  int count = 0;
+  for (int i = 0; i < MAX_MQTT_PUBLISH_MESSAGES; i++) {
+    if (_publishbuf[i].pub_timer.read_ms() > MQTT_PUBLISH_TIMEOUT) {
+      _publishbuf[i].pub_message.id = 0;
+      _publishbuf[i].pub_timer.stop();
+      _publishbuf[i].pub_timer.reset();
+      count++;
+    }
+  }
+  _lock.unlock();
+  DBG("MQTT send buffer cleared, %d stale messages removed.", count);
+}
 
 void MQTTClient::mqtt_health_check() {
-  int rc = has_connection_timed_out();
-  if (rc == -2) {
-    ERR("MQTT health check found MQTT server to be unresponsive, disconnecting ... [FAIL]");
-    disconnect();
+  if (_is_connected) {
+    int rc = has_connection_timed_out();
+    if (rc == -1 && _ping_request_sent == false) {
+      DBG("MQTT keep alive expired, sending ping request...");
+      send_ping_request();
+    } else if (rc == -2) {
+      ERR("MQTT broker is unresponsive, MQTT client will disconnect ... [FAIL]");
+      disconnect();
+    }
+    DBG("MQTT health check task executed: [timed_out] %d, [timer_ms] %u, [keep_alive] %d", rc, _timer.read_ms(),
+        _keepalive_interval);
   }
-  DBG("MQTT health check task executed: [timed_out] %d, [timer_ms] %u, [keep_alive] %d", rc, _com_timer.read_ms(),
-      _keepalive_interval);
 }
+
+void MQTTClient::clean_session() {
+  for (int i = 0; i < MAX_MQTT_MESSAGE_HANDLERS; ++i) {
+    _message_handlers[i].topic_filter = 0;
+  }
+
+  for (int i = 0; i < MAX_MQTT_PUBLISH_MESSAGES; ++i) {
+    _publishbuf[i].pub_message.id = 0;
+    _publishbuf[i].pub_timer.stop();
+    _publishbuf[i].pub_timer.reset();
+  }
+
+#if MQTTCLIENT_QOS1 || MQTTCLIENT_QOS2
+  inflightMsgid = 0;
+  inflightQoS = QOS0;
+#endif
+
+#if MQTTCLIENT_QOS2
+  pubrel = false;
+  for (int i = 0; i < MAX_INCOMING_QOS2_MESSAGES; ++i) {
+    incomingQoS2messages[i] = 0;
+  }
+#endif
 }
+
+#if MQTTCLIENT_QOS2
+template <class Network, class Timer, int a, int b>
+bool MQTT::Client<Network, Timer, a, b>::isQoS2msgidFree(unsigned short id) {
+  for (int i = 0; i < MAX_INCOMING_QOS2_MESSAGES; ++i) {
+    if (incomingQoS2messages[i] == id) return false;
+  }
+  return true;
+}
+
+template <class Network, class Timer, int a, int b>
+bool MQTT::Client<Network, Timer, a, b>::useQoS2msgid(unsigned short id) {
+  for (int i = 0; i < MAX_INCOMING_QOS2_MESSAGES; ++i) {
+    if (incomingQoS2messages[i] == 0) {
+      incomingQoS2messages[i] = id;
+      return true;
+    }
+  }
+  return false;
+}
+
+template <class Network, class Timer, int a, int b>
+void MQTT::Client<Network, Timer, a, b>::freeQoS2msgid(unsigned short id) {
+  for (int i = 0; i < MAX_INCOMING_QOS2_MESSAGES; ++i) {
+    if (incomingQoS2messages[i] == id) {
+      incomingQoS2messages[i] = 0;
+      return;
+    }
+  }
+}
+#endif
+}  // namespace MQTT

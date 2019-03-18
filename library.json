@@ -1,14 +1,12 @@
 {
-  "name": "MQTT-client-on-mbed",
-  "keywords": "mqtts",
-  "description": "Secure MQTT client using MBED TLS for SSL/TLS connection",
-  "repository":
-  {
+  "name": "mbed-MQTT-client",
+  "keywords": "mbed, tls, mqtt, mqtts",
+  "description": "Secure MQTT client using mbed TLS for SSL/TLS connection",
+  "repository": {
     "type": "git",
-    "url": "https://github.com/ravihansa3000/MQTT-client-on-mbed.git"
+    "url": "https://github.com/kasperglobal/mbed-MQTT-client.git"
   },
-  "authors":
-  [
+  "authors": [
     {
       "name": "Vergil Cola"
     },

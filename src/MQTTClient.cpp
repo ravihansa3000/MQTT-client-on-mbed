@@ -1,257 +1,117 @@
 #include "MQTTClient.h"
 
 namespace MQTT {
+const char *MQTTClient::DRBG_PERS = "mbed TLS MQTT client";
 
 MQTTClient::MQTTClient(RtosLogger *logger, NetworkInterface *net, bool use_tls, bool ssl_cert_verify, const char *pem)
-    : _logger(logger),
+    : _is_connected(false),
+      _ssl_initialized(false),
+      _has_saved_session(false),
+      _ping_request_sent(false),
+      _logger(logger),
       _network(net),
-      _initialized(false),
+      _equeue(MQTT_PUBLISH_EVENT_QUEUE_SIZE * EVENTS_MQTT_PUBLISH_EVENT_SIZE, NULL),
       _use_tls(use_tls),
       _ssl_cert_verify(ssl_cert_verify),
       _ssl_ca_pem(pem),
-      _port(use_tls ? 8883 : 1883),
-      _equeue(MQTT_EVENT_QUEUE_SIZE * EVENTS_EVENT_SIZE),
-      _is_connected(false),
-      _is_running(false),
-      _has_saved_session(false),
-      _ping_request_sent(false),
-      _mqtt_ticker(),
-      _lock(),
-      _publisher_thread(osPriorityNormal, PUBLISHER_STACK_SIZE, NULL, "MQTT_Publisher") {}
+      _port(0),
+      _sendbuf{0},
+      _readbuf{0},
+      _keepalive_interval(0),
+      _message_handlers{0},
+      _publishbuf() {}
 
 MQTTClient::~MQTTClient() {
-  _is_running = false;  // break the MQTT client listener loop
+  disconnect();
   free_tls();
+}
+
+int MQTTClient::connect() {
+  int rc;
+  if (_network == NULL || _host.empty()) {
+    ERR("MQTT settings not set ... [FAIL]");
+    return FAILURE;
+  }
+
   if (_is_connected) {
-    disconnect();
-  }
-  delete _tcpsocket;
-  _equeue.break_dispatch();
-}
-
-int MQTTClient::init() {
-  MQTTClientError err = Ok;
-  if (!_initialized) {
-    do {
-      DRBG_PERS = "mbed TLS MQTT client";
-      _tcpsocket = new TCPSocket();
-      if (_tcpsocket == NULL) {
-        ERR("Failed to create TCP socket ... [FAIL]");
-        err = TCPSocketError;
-        break;
-      }
-      setup_tls();
-
-      _is_running = true;
-      osStatus status = _publisher_thread.start(callback(this, &MQTTClient::mqtt_publisher_task));
-      if (status != osOK) {
-        ERR("Failed to start MQTT publisher thread ... [FAIL]");
-        err = PublisherError;
-        _is_running = false;
-        break;
-      }
-      _initialized = true;
-      INFO("Initialized MQTT client [TLS] %s", (_use_tls == true ? "true" : "false"));
-    } while (0);
+    WARN("MQTT client is already connected!");
+    return INVALID;
   }
 
-  return err;
-}
-
-void MQTTClient::mqtt_publisher_task() {
-  osThreadId threadId = osThreadGetId();
-  INFO("MQTT publisher task thread (TID: %p) started with a stack size of %d ... [OK]", threadId, PUBLISHER_STACK_SIZE);
-  _mqtt_ticker.attach(_equeue.event(callback(this, &MQTTClient::mqtt_health_check)), MQTT_HEALTH_CHECK_INTERVAL);
-  _equeue.dispatch_forever();  // dispatch messages queued to be published
-  INFO("MQTT publisher task finished.");
-}
-
-int MQTTClient::send_bytes_from_buffer(char *buffer, size_t size) {
-  int rc;
-  if (_tcpsocket == NULL) {
-    ERR("TCP socket not initialized ... [FAIL]");
-    return -1;
-  }
-
-  if (_use_tls) {  // Do SSL/TLS write
-    rc = mbedtls_ssl_write(&_ssl, (const unsigned char *)buffer, size);
-    if (MBEDTLS_ERR_SSL_WANT_WRITE == rc) {
-      return TIMEOUT;
-    } else {
-      DBG("TLS socket write: [rc] %d", rc);
-      return rc;
+  if (_use_tls) {
+    if ((rc = mbedtls_ssl_session_reset(&_ssl)) != 0) {
+      ERR("mbedtls_ssl_session_reset failed (error code: %d) ... [FAIL]", rc);
+      free_tls();
+      return FAILURE;
     }
+
+#if defined(MBEDTLS_SSL_CLI_C)
+    if (_has_saved_session && ((rc = mbedtls_ssl_set_session(&_ssl, &_ssl_saved_session)) != 0)) {
+      _has_saved_session = false;
+      ERR("mbedtls_ssl_set_session failed (error code: %d) ... [FAIL]", rc);
+      free_tls();
+      return FAILURE;
+    }
+#endif
+
+    DBG("mbedtls_ssl_set_hostname...");
+    mbedtls_ssl_set_hostname(&_ssl, _host.c_str());
+    DBG("mbedtls_ssl_set_bio...");
+    mbedtls_ssl_set_bio(&_ssl, static_cast<MQTTClient *>(this), ssl_send, ssl_recv, NULL);
+  }
+
+  INFO("Connecting to MQTT broker [host] %s, [port] %d ...", _host.c_str(), _port);
+  _tcpsocket.open(_network);
+  _tcpsocket.set_timeout(MQTT_SOCKET_TIMEOUT);
+
+  if ((rc = _tcpsocket.connect(_host.c_str(), _port)) < 0) {
+    ERR("Could not connect to MQTT broker [host] %s, [port] %d, [rc] %d", _host.c_str(), _port, rc);
+    _tcpsocket.close();
+    return rc;  // return network error
   } else {
-    rc = _tcpsocket->send(buffer, size);
-    if (NSAPI_ERROR_WOULD_BLOCK == rc) {
-      return TIMEOUT;
+    INFO("Socket connected [host] %s, [port] %d, [rc] %d", _host.c_str(), _port, rc);
+  }
+
+  if (_use_tls) {
+    if ((rc = do_tls_handshake()) < 0) {
+      ERR("TLS handshake failed (error code: %d) ... [FAIL]", rc);
+      return FAILURE;
     } else {
-      DBG("socket write: [rc] %d", rc);
-      return rc;
+      INFO("TLS handshake successful ... [OK]");
     }
   }
-}
 
-int MQTTClient::read_packet_length(int *value) {
-  int rc = MQTTPACKET_READ_ERROR;
-  unsigned char c;
-  int multiplier = 1;
-  int len = 0;
-  const int MAX_NO_OF_REMAINING_LENGTH_BYTES = 4;
-
-  *value = 0;
-  do {
-    if (++len > MAX_NO_OF_REMAINING_LENGTH_BYTES) {
-      rc = MQTTPACKET_READ_ERROR; /* bad data */
-      goto exit;
-    }
-
-    rc = read_bytes_to_buffer((char *)&c, 1);
-    if (rc != 1) {
-      rc = MQTTPACKET_READ_ERROR;
-      goto exit;
-    }
-
-    *value += (c & 127) * multiplier;
-    multiplier *= 128;
-  } while ((c & 128) != 0);
-
-  rc = MQTTPACKET_READ_COMPLETE;
-
-exit:
-  if (rc == MQTTPACKET_READ_ERROR) {
-    len = -1;
-  }
-  DBG("Packet length: %d", len);
-  return len;
-}
-
-int MQTTClient::send_packet(size_t length) {
-  int rc = FAILURE;
-  unsigned int sent = 0;
-
-  while (sent < length) {
-    rc = send_bytes_from_buffer((char *)&_sendbuf[sent], length - sent);
-    if (rc < 0) {  // there was an error writing the data
-      ERR("Failed to send data (error code: %d) ... [FAIL]", rc);
-      break;
-    }
-    sent += rc;
-  }
-
-  if (sent == length) {
-    rc = SUCCESS;
-  } else {
-    rc = FAILURE;
-    ERR("Failed to send packet, sent %d of %d bytes ... [FAIL]", sent, length);
-  }
-  return rc;
-}
-
-int MQTTClient::read_bytes_to_buffer(char *buffer, size_t size) {
-  int rc;
-  if (_tcpsocket == NULL) {
-    ERR("TCP socket not initialized ... [FAIL]");
-    return -1;
-  }
-  if (_use_tls) {  // Do SSL/TLS read
-    rc = mbedtls_ssl_read(&_ssl, (unsigned char *)buffer, size);
-    if (MBEDTLS_ERR_SSL_WANT_READ == rc) {
-      return TIMEOUT;
-    } else {
-      DBG("TLS socket read: [rc] %d", rc);
-      return rc;
-    }
-  } else {
-    rc = _tcpsocket->recv((void *)buffer, size);
-    if (NSAPI_ERROR_WOULD_BLOCK == rc) {
-      return TIMEOUT;
-    } else {
-      DBG("socket read: [rc] %d", rc);
-      return rc;  // return the number of bytes received or error
-    }
-  }
-}
-
-/**
-* Reads the entire packet to readbuf and returns the type of packet when successful, otherwise
-* a negative error code is returned.
-**/
-int MQTTClient::read_packet() {
-  int rc = FAILURE;
-  MQTTHeader header = {0};
-  int len = 0;
-  int rem_len = 0;
-
-  // 1. Read the header byte.  This has the packet type in it.
-  if ((rc = read_bytes_to_buffer((char *)&_readbuf[0], 1)) != 1) {
-    if (rc == TIMEOUT) {  // data is not available yet
-      goto exit;
-    }
-    ERR("Failed to read packet header (error code: %d) ... [FAIL]", rc);
-    goto exit;
-  }
-
-  // 2. Read the remaining length.  This is variable in itself
-  len = 1;
-  if ((rc = read_packet_length(&rem_len)) < 0) {
-    ERR("Failed to read remaining length value (error code: %d) ... [FAIL]", rc);
-    goto exit;
-  }
-
-  len += MQTTPacket_encode(_readbuf + 1, rem_len);  // put the original remaining length into the buffer
-
-  if (rem_len > (MAX_MQTT_PACKET_SIZE - len)) {
-    rc = BUFFER_OVERFLOW;
-    ERR("Failed to read packet, buffer overflow detected ... [FAIL]");
-    goto exit;
-  }
-
-  // 3. Read the rest of the buffer using a callback to supply the rest of the data
-  if (rem_len > 0 && ((rc = read_bytes_to_buffer((char *)(_readbuf + len), rem_len)) != rem_len)) {
-    ERR("Failed to read remaining data in packet (error code: %d) ... [FAIL]", rc);
-    goto exit;
-  }
-
-  // Convert the header to type and update rc
-  header.byte = _readbuf[0];
-  rc = header.bits.type;
-
-exit:
+  // authenticate and wait for connection acknowledgement
+  rc = login();
   return rc;
 }
 
 int MQTTClient::login() {
-  int rc = FAILURE;
+  int rc;
   int len = 0;
 
-  if (!_is_connected) {
-    ERR("Session not connected ... [FAIL]");
-    return rc;
-  }
-
   /**
-  * Copy the _keepalive_interval value to local MQTT specifies in seconds, we have to multiply that
-  * amount for our 32 bit timers which accepts ms.
-  **/
-  _keepalive_interval = (_connect_options.keepAliveInterval * 1000);
+   * Copy the _keepalive_interval value to local MQTT specifies in seconds, we have to multiply that
+   * amount for our 32 bit timers which accepts ms.
+   **/
+  _keepalive_interval = (unsigned short)(_connect_options.keepAliveInterval * 1000);
   DBG("Authenticating with MQTT credentials. [username] %s, [password] *****", _connect_options.username.cstring);
-  _lock.lock();
+
   if ((len = MQTTSerialize_connect(_sendbuf, MAX_MQTT_PACKET_SIZE, &_connect_options)) <= 0) {
     ERR("Error serializing connect packet (error code: %d) ... [FAIL]", len);
-    _lock.unlock();
-    return rc;
+    return FAILURE;
   }
+
   rc = send_packet((size_t)len);
-  _lock.unlock();
+
   if (rc != SUCCESS) {  // send the connect packet
     ERR("Error sending the connect request packet (error code: %d) ... [FAIL]", rc);
-    return rc;
+    return FAILURE;
   }
 
   // Wait for the CONNACK
   unsigned char connack_rc = 255;
-  rc = read_until(CONNACK, COMMAND_TIMEOUT);
+  rc = read_until(CONNACK, MQTT_COMMAND_TIMEOUT);
   if (rc == CONNACK) {
     bool sessionPresent = false;
     DBG("Connection acknowledgement received, deserializing response...");
@@ -266,68 +126,253 @@ int MQTTClient::login() {
     ERR("Error while waiting for connection acknowledgement ... [FAIL]", rc);
     rc = FAILURE;
   }
-  if (rc == SUCCESS) {
-    INFO("MQTT connection established, starting connection timers ... [OK]");
+
+  if (rc == CONNACK_RC::ACCEPTED) {
     reset_connection_timer();  // reset connection timers for the new MQTT session
+    _is_connected = true;
+    INFO("MQTT connection established, starting connection timers ... [OK]");
+    return SUCCESS;
+  } else {
+    ERR("MQTT connect CONNACK error (error code: %d) ... [FAIL]", rc);
+    return FAILURE;
   }
-  DBG("MQTT login returning with [rc] %d, [connack_rc] %d", rc, connack_rc);
+}
+
+int MQTTClient::disconnect() {
+  if (!_is_connected) {
+    WARN("MQTT client is already disconnected.");
+    return INVALID;
+  }
+
+  DBG("MQTT client disconnecting...");
+  int rc = FAILURE;
+  int len = MQTTSerialize_disconnect(_sendbuf, MAX_MQTT_PACKET_SIZE);
+  if (len > 0) {
+    rc = send_packet(len);  // send the disconnect packet
+  }
+
+  // close the TCP socket and cleanup allocated resources
+  _tcpsocket.close();
+
+  if (_connect_options.cleansession) {
+    clean_session();
+  }
+
+  _is_connected = false;
+  INFO("MQTT client disconnected.");
   return rc;
 }
 
-void MQTTClient::disconnect() {
-  int rc = 0;
-  if (_use_tls && (rc = mbedtls_ssl_session_reset(&_ssl) != 0)) {
-    ERR("mbedtls_ssl_session_reset failed (error code: %d) ... [FAIL]", rc);
+int MQTTClient::publish(const char *topic, const char *payload, MQTT::QoS qos, bool retained, bool dup) {
+  int topiclen = strlen(topic);
+  if (strlen(topic) > MAX_MQTT_TOPIC_SIZE) {
+    ERR("Could not publish MQTT message, topic length exceeds max limit: [len] %d, [max] %d", topiclen,
+        MAX_MQTT_TOPIC_SIZE);
+    return BUFFER_OVERFLOW;
   }
-  _is_connected = false;
-  _tcpsocket->close();
-  INFO("MQTT client disconnected.");
-}
-
-int MQTTClient::connect() {
-  int ret = FAILURE;
-  if ((_network == NULL) || (_tcpsocket == NULL) || _host.empty()) {
-    ERR("Network settings not set ... [FAIL]");
-    return ret;
+  int payloadlen = strlen(payload);
+  if (payloadlen > MAX_MQTT_PAYLOAD_SIZE) {
+    ERR("Could not publish MQTT message, payload length exceeds max limit: [len] %d, [max] %d", payloadlen,
+        MAX_MQTT_PAYLOAD_SIZE);
+    return BUFFER_OVERFLOW;
   }
-
-  if (_use_tls) {
-    if ((ret = mbedtls_ssl_session_reset(&_ssl)) != 0) {
-      ERR("mbedtls_ssl_session_reset failed (error code: %d) ... [FAIL]", ret);
-      return ret;
-    }
-#if defined(MBEDTLS_SSL_CLI_C)
-    if (_has_saved_session && ((ret = mbedtls_ssl_set_session(&_ssl, &_ssl_saved_session)) != 0)) {
-      ERR("mbedtls_ssl_conf_session failed (error code: %d) ... [FAIL]", ret);
-      return ret;
-    }
-#endif
+  if (qos != QOS0) {  // TODO: only QoS0 is supported for now
+    ERR("Could not publish MQTT message, unsupported QoS: [topic] %s, [payload] %s, [QoS] %d", topic, payload, qos);
+    return FAILURE;
   }
 
-  _tcpsocket->open(_network);
-  _tcpsocket->set_timeout(DEFAULT_SOCKET_TIMEOUT);
-  if (_use_tls) {
-    DBG("mbedtls_ssl_set_hostname...");
-    mbedtls_ssl_set_hostname(&_ssl, _host.c_str());
-    DBG("mbedtls_ssl_set_bio...");
-    mbedtls_ssl_set_bio(&_ssl, static_cast<MQTTClient *>(this), ssl_send, ssl_recv, NULL);
+  MQTTString mqtt_topic = MQTTString_initializer;
+  _lock.lock();
+
+  if (!_is_connected) {
+    _lock.unlock();
+    ERR("Could not publish MQTT message [topic] %s, not connected ... [FAIL]", topic);
+    return FAILURE;
   }
 
-  if ((ret = _tcpsocket->connect(_host.c_str(), _port)) < 0) {
-    ERR("Error connecting to [host] %s, [port] %d, [rc] %d", _host.c_str(), _port, ret);
-    return ret;
+  int id = _packetid.get_next();
+  mqtt_topic.cstring = (char *)topic;
+  int len = MQTTSerialize_publish(_sendbuf, MAX_MQTT_PACKET_SIZE, dup, qos, retained, id, mqtt_topic,
+                                  (unsigned char *)payload, payloadlen);
+  if (len <= 0) {
+    _lock.unlock();
+    ERR("Failed serializing publish message (error code: %d) ... [FAIL]", len);
+    return MQTT_ERROR;
+  }
+  int rc = send_packet(len);
+  _lock.unlock();
+
+  if (rc == SUCCESS) {
+    // reset_connection_timer(); // reset timers if we have been able to send successfully
+    // TODO: troubleshoot mbedOS bug: send packet returns success although connection is broken
+    DBG("Successfully published MQTT message, [topic] %s, [payload] %s, [qos] %d", topic, payload, qos);
+    return SUCCESS;
   } else {
-    DBG("Successfully connected to MQTT server [host] %s, [port] %d, [rc] %d", _host.c_str(), _port, ret);
-    _is_connected = true;
+    ERR("Could not send MQTT message (error code: %d) ... [FAIL]", rc);
+    return NETWORK_ERROR;
   }
-  if (_use_tls) {
-    if ((ret = do_tls_handshake()) < 0) {
-      ERR("TLS handshake failed (error code: %d) ... [FAIL]", ret);
-      return FAILURE;
-    } else {
-      INFO("TLS handshake successful ... [OK]");
+}
+
+int MQTTClient::post_publish(const char *topic, const char *payload, MQTT::QoS qos, bool retained, bool dup) {
+  int topiclen = strlen(topic);
+  if (strlen(topic) > MAX_MQTT_TOPIC_SIZE) {
+    ERR("Could not publish MQTT message, topic length exceeds max limit: [len] %d, [max] %d", topiclen,
+        MAX_MQTT_TOPIC_SIZE);
+    return BUFFER_OVERFLOW;
+  }
+  size_t payloadlen = strlen(payload);
+  if (payloadlen > MAX_MQTT_PAYLOAD_SIZE) {
+    ERR("Could not publish MQTT message, payload length exceeds max limit: [len] %d, [max] %d", payloadlen,
+        MAX_MQTT_PAYLOAD_SIZE);
+    return BUFFER_OVERFLOW;
+  }
+  if (qos != QOS0) {  // TODO: only QoS0 is supported for now
+    ERR("Could not publish MQTT message, unsupported QoS: [topic] %s, [payload] %s, [QoS] %d", topic, payload, qos);
+    return FAILURE;
+  }
+
+  int i = 0;
+  _lock.lock();
+
+  if (!_is_connected) {
+    _lock.unlock();
+    ERR("Could not publish MQTT message [topic] %s, not connected ... [FAIL]", topic);
+    return FAILURE;
+  }
+
+  while (i < MAX_MQTT_PUBLISH_MESSAGES) {
+    if (_publishbuf[i].pub_message.id == 0) {
+      break;
+    }
+    i++;
+  }
+  if (i >= MAX_MQTT_PUBLISH_MESSAGES) {
+    _lock.unlock();
+    ERR("Could not add to MQTT publish queue [topic] %s, publish buffer is full ... [FAIL]", topic);
+    return BUFFER_FULL;
+  }
+  _publishbuf[i].pub_message.id = _packetid.get_next();
+  _publishbuf[i].pub_message.qos = qos;
+  _publishbuf[i].pub_message.retained = retained;
+  _publishbuf[i].pub_message.dup = dup;
+  _publishbuf[i].pub_message.payloadlen = payloadlen;
+  snprintf(_publishbuf[i].pub_message.topic, sizeof(MQTTMessage::topic), "%s", topic);
+  snprintf(_publishbuf[i].pub_message.payload, sizeof(MQTTMessage::payload), "%s", payload);
+  _publishbuf[i].pub_timer.reset();
+  _publishbuf[i].pub_timer.start();
+
+  int rc = _equeue.call(callback(this, &MQTTClient::post_publish_callback), i);
+  if (rc == 0) {
+    _publishbuf[i].pub_message.id = 0;
+    _lock.unlock();
+    ERR("Could not add to MQTT publish queue [topic] %s, event queue is full ... [FAIL]", topic);
+    return BUFFER_FULL;
+  } else {
+    _lock.unlock();
+    return SUCCESS;
+  }
+}
+
+void MQTTClient::post_publish_callback(int index) {
+  if (index < 0 || index >= MAX_MQTT_PUBLISH_MESSAGES) {
+    ERR("Could not send queued MQTT message, invalid index: %d ... [FAIL]", index);
+    return;
+  }
+
+  if (_publishbuf[index].pub_message.id == 0) {
+    return;
+  }
+
+  MQTTString mqtt_topic = MQTTString_initializer;
+  _lock.lock();
+
+  if (!_is_connected) {
+    _lock.unlock();
+    ERR("Could not send queued MQTT message, not connected ... [FAIL]");
+    return;
+  }
+
+  if (_publishbuf[index].pub_timer.read_ms() > MQTT_PUBLISH_TIMEOUT) {
+    _publishbuf[index].pub_message.id = 0;  // mark publish message buffer space as free
+    _publishbuf[index].pub_timer.stop();
+    _publishbuf[index].pub_timer.reset();
+    _lock.unlock();
+    ERR("Could not send queued MQTT message, timeout expired ... [FAIL]");
+    return;
+  }
+
+  mqtt_topic.cstring = (char *)&_publishbuf[index].pub_message.topic[0];
+  int len = MQTTSerialize_publish(_sendbuf, MAX_MQTT_PACKET_SIZE, 0, _publishbuf[index].pub_message.qos, false,
+                                  _publishbuf[index].pub_message.id, mqtt_topic,
+                                  (unsigned char *)&_publishbuf[index].pub_message.payload[0],
+                                  (int)_publishbuf[index].pub_message.payloadlen);
+
+  if (len <= 0) {
+    _publishbuf[index].pub_message.id = 0;  // mark publish message buffer space as free
+    _publishbuf[index].pub_timer.stop();
+    _publishbuf[index].pub_timer.reset();
+    _lock.unlock();
+    ERR("Failed to serialize publish message (error code: %d) ... [FAIL]", len);
+    return;
+  }
+
+  int rc = send_packet(len);
+  _publishbuf[index].pub_message.id = 0;  // mark publish message buffer space as free
+  _publishbuf[index].pub_timer.stop();
+  _publishbuf[index].pub_timer.reset();
+  _lock.unlock();
+
+  if (rc == SUCCESS) {
+    // reset_connection_timer(); // reset timers if we have been able to send successfully
+    // TODO: troubleshoot mbedOS bug: send packet returns success although connection is broken
+    DBG("Successfully published MQTT message, [topic] %s, [payload] %s, [qos] %d", _publishbuf[index].pub_message.topic,
+        _publishbuf[index].pub_message.payload, _publishbuf[index].pub_message.qos);
+  } else {
+    ERR("Could not send MQTT message (error code: %d) ... [FAIL]", rc);
+  }
+}
+
+void MQTTClient::set_connection_parameters(const char *host, uint16_t port, MQTTPacket_connectData &options) {
+  _host = host;
+  _port = port;
+  _connect_options = options;
+}
+
+int MQTTClient::set_message_handler(const char *topic, Callback<void(MQTTMessage &)> cb) {
+  int rc = FAILURE;
+  int i = -1;
+  for (i = 0; i < MAX_MQTT_MESSAGE_HANDLERS; ++i) {  // first check for an existing matching slot
+    if (_message_handlers[i].topic_filter != 0 && strcmp(_message_handlers[i].topic_filter, topic) == 0) {
+      if (cb) {  // replace existing
+        _message_handlers[i].topic_cb = cb;
+      } else {  // remove existing
+        _message_handlers[i].topic_filter = 0;
+        _message_handlers[i].topic_cb = 0;
+      }
+      rc = SUCCESS;  // return i when adding new subscription
+      break;
     }
   }
-  return login();
+
+  if (cb) {  // if no existing, look for empty slot (unless we are removing)
+    if (rc == FAILURE) {
+      for (i = 0; i < MAX_MQTT_MESSAGE_HANDLERS; ++i) {
+        if (_message_handlers[i].topic_filter == 0) {
+          rc = SUCCESS;
+          break;
+        }
+      }
+    }
+    if (i < MAX_MQTT_MESSAGE_HANDLERS) {
+      _message_handlers[i].topic_filter = topic;
+      _message_handlers[i].topic_cb = cb;
+    }
+  }
+  return rc;
 }
-}
+
+EventQueue &MQTTClient::equeue() { return _equeue; }
+
+bool MQTTClient::is_connected() { return _is_connected; }
+
+}  // namespace MQTT
